@@ -30,15 +30,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "ANDROID_HOME=$ANDROID_HOME"
           SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | head -n 1)"
-          if [ -z "$SDKMANAGER" ]; then
-            echo "sdkmanager not found under $ANDROID_HOME/cmdline-tools"
-            find "$ANDROID_HOME" -maxdepth 4 -type f -name sdkmanager -print || true
-            exit 1
-          fi
+          test -n "$SDKMANAGER"
           echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
-          echo "Using $SDKMANAGER"
           "$SDKMANAGER" --version
 
       - name: Install Android 16 SDK
@@ -47,6 +41,16 @@ jobs:
           set -euo pipefail
           yes | "$SDKMANAGER" --licenses >/dev/null || true
           "$SDKMANAGER" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Check signing secrets
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$SIGNING_KEY" || { echo "Missing ANDROID_SIGNING_KEY secret"; exit 1; }
+          test -n "$STORE_PASSWORD" || { echo "Missing ANDROID_KEYSTORE_PASSWORD secret"; exit 1; }
 
       - name: Extract Android project
         shell: bash
@@ -58,30 +62,39 @@ jobs:
           test -f project/settings.gradle
           test -f project/build.gradle
           test -f project/app/build.gradle
-          echo "Project extracted successfully"
-          find project -maxdepth 3 -type f | sort
 
       - name: Set up Gradle 9.4.1
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "9.4.1"
 
-      - name: Build debug APK
+      - name: Build unsigned release APK
         working-directory: project
         shell: bash
         run: |
           set -euo pipefail
-          gradle --version
-          gradle --no-daemon :app:assembleDebug --stacktrace
+          gradle --no-daemon :app:assembleRelease --stacktrace
 
-      - name: Prepare APK
+      - name: Sign APK with permanent key
         shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |
           set -euo pipefail
-          APK="project/app/build/outputs/apk/debug/app-debug.apk"
-          test -f "$APK"
-          cp "$APK" NegahJavan-Android16.apk
-          ls -lh NegahJavan-Android16.apk
+          printf '%s' "$SIGNING_KEY" | base64 --decode > signing.jks
+          UNSIGNED="project/app/build/outputs/apk/release/app-release-unsigned.apk"
+          test -f "$UNSIGNED"
+          "$ANDROID_HOME/build-tools/36.0.0/zipalign" -f -p 4 "$UNSIGNED" aligned.apk
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" sign \
+            --ks signing.jks \
+            --ks-key-alias negahjavan \
+            --ks-pass env:STORE_PASSWORD \
+            --key-pass env:STORE_PASSWORD \
+            --out NegahJavan-Android16.apk \
+            aligned.apk
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs NegahJavan-Android16.apk
+          rm -f signing.jks aligned.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
